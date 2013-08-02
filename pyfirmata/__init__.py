@@ -1,10 +1,21 @@
 from pyfirmata import *
 from boards import BOARDS
 
-__version__ = '0.9.5'  # Don't forget to change in setup.py!
+__version__ = '0.10.0'  # Don't forget to change in setup.py!
 
 # shortcut classes
 
+class AutoDetect(Board):
+    def __init__(self, *args, **kwargs):
+        args = list(args)
+        args.append('Auto')
+        super(AutoDetect, self).__init__(*args, **kwargs)
+
+    def __str__(self):
+        return 'AutoDetected: {name} on {port}'.format(
+            name=self.name,
+            port=self.sp.port
+        )
 
 class Arduino(Board):
     """
@@ -16,7 +27,10 @@ class Arduino(Board):
         super(Arduino, self).__init__(*args, **kwargs)
 
     def __str__(self):
-        return 'Arduino %s on %s' % (self.name, self.sp.port)
+        return 'Arduino {name} on {port}'.format(
+            name=self.name,
+            port=self.sp.port
+        )
 
 
 class ArduinoMega(Board):
@@ -29,4 +43,7 @@ class ArduinoMega(Board):
         super(ArduinoMega, self).__init__(*args, **kwargs)
 
     def __str__(self):
-        return 'Arduino Mega %s on %s' % (self.name, self.sp.port)
+        return 'Arduino Mega {name} on {port}'.format(
+            name=self.name,
+            port=self.sp.port
+        )

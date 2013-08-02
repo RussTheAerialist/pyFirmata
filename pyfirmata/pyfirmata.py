@@ -1,3 +1,5 @@
+from collections import defaultdict
+import logging
 import serial
 import inspect
 import time
@@ -22,16 +24,24 @@ QUERY_FIRMWARE = 0x79       # query the firmware name
 
 # extended command set using sysex (0-127/0x00-0x7F)
 # 0x00-0x0F reserved for user-defined commands */
-SERVO_CONFIG = 0x70         # set max angle, minPulse, maxPulse, freq
-STRING_DATA = 0x71          # a string message with 14-bits per char
-SHIFT_DATA = 0x75           # a bitstream to/from a shift register
-I2C_REQUEST = 0x76          # send an I2C read/write request
-I2C_REPLY = 0x77            # a reply to an I2C read request
-I2C_CONFIG = 0x78           # config I2C settings such as delay times and power pins
-REPORT_FIRMWARE = 0x79      # report name and version of the firmware
-SAMPLING_INTERVAL = 0x7A    # set the poll rate of the main loop
-SYSEX_NON_REALTIME = 0x7E   # MIDI Reserved for non-realtime messages
-SYSEX_REALTIME = 0x7F       # MIDI Reserved for realtime messages
+RESERVED_COMMAND = 0x00         # 2nd SysEx data byte is a chip-specific command
+ANALOG_MAPPING_QUERY = 0x69     # Ask for mapping of analog to pin numbers
+ANALOG_MAPPING_RESPONSE = 0x6A  # Reply with mapping info
+CAPABILITY_QUERY = 0x6B         # Ask for supported modes and resolution of all pins
+CAPABILITY_RESPONSE = 0x6C      # Reply with supported modes and resolution
+PIN_STATE_QUERY = 0x6D          # Ask for a pin's current mode and value
+PIN_STATE_RESPONSE = 0x6E       # Reply with a pin's current mode and value
+EXTENDED_ANALOG = 0x6F          # Analog Write (PWM, Servo, etc) to any pin
+SERVO_CONFIG = 0x70             # set max angle, minPulse, maxPulse, freq
+STRING_DATA = 0x71              # a string message with 14-bits per char
+SHIFT_DATA = 0x75               # a bitstream to/from a shift register
+I2C_REQUEST = 0x76              # send an I2C read/write request
+I2C_REPLY = 0x77                # a reply to an I2C read request
+I2C_CONFIG = 0x78               # config I2C settings such as delay times and power pins
+REPORT_FIRMWARE = 0x79          # report name and version of the firmware
+SAMPLING_INTERVAL = 0x7A        # set the poll rate of the main loop
+SYSEX_NON_REALTIME = 0x7E       # MIDI Reserved for non-realtime messages
+SYSEX_REALTIME = 0x7F           # MIDI Reserved for realtime messages
 
 
 # Pin modes.
@@ -66,6 +76,7 @@ class Board(object):
     firmata_version = None
     firmware = None
     firmware_version = None
+    capabilities = None
     _command_handlers = {}
     _command = None
     _stored_data = []
@@ -81,13 +92,26 @@ class Board(object):
         self.name = name
         if not self.name:
             self.name = port
-        self.setup_layout(layout)
+
+        # Add Handlers before we do anything because all messages should be handled.
+        self.add_default_handlers()
+
         # Iterate over the first messages to get firmware data
         while self.bytes_available():
             self.iterate()
-        # TODO Test whether we got a firmware name and version, otherwise there 
+        # TODO Test whether we got a firmware name and version, otherwise there
         # probably isn't any Firmata installed
-        
+        logging.debug("Firmata v{major}.{minor}".format(
+            major=self.firmware_version[0],
+            minor=self.firmware_version[1]
+        ))
+
+        if layout == "Auto":
+            self.setup_layout_by_capabilities()
+        else:
+            self.setup_layout(layout)
+            self.capabilities = None
+
     def __str__(self):
         return "Board %s on %s" % (self.name, self.sp.port)
         
@@ -101,6 +125,14 @@ class Board(object):
         
     def send_as_two_bytes(self, val):
         self.sp.write(chr(val % 128) + chr(val >> 7))
+
+    def add_default_handlers(self):
+        # Setup default handlers for standard incoming commands
+        self.add_cmd_handler(ANALOG_MESSAGE, self._handle_analog_message)
+        self.add_cmd_handler(DIGITAL_MESSAGE, self._handle_digital_message)
+        self.add_cmd_handler(REPORT_VERSION, self._handle_report_version)
+        self.add_cmd_handler(REPORT_FIRMWARE, self._handle_report_firmware)
+        self.add_cmd_handler(CAPABILITY_RESPONSE, self._handle_capability_response)
 
     def setup_layout(self, board_layout):
         """
@@ -136,12 +168,6 @@ class Board(object):
         self.taken = { 'analog' : dict(map(lambda p: (p.pin_number, False), self.analog)),
                        'digital' : dict(map(lambda p: (p.pin_number, False), self.digital)) }
 
-        # Setup default handlers for standard incoming commands
-        self.add_cmd_handler(ANALOG_MESSAGE, self._handle_analog_message)
-        self.add_cmd_handler(DIGITAL_MESSAGE, self._handle_digital_message)
-        self.add_cmd_handler(REPORT_VERSION, self._handle_report_version)
-        self.add_cmd_handler(REPORT_FIRMWARE, self._handle_report_firmware)
-    
     def add_cmd_handler(self, cmd, func):
         """ 
         Adds a command handler for a command.
@@ -313,7 +339,7 @@ class Board(object):
     def _handle_digital_message(self, port_nr, lsb, msb):
         """
         Digital messages always go by the whole port. This means we have a
-        bitmask wich we update the port.
+        bitmask which we update the port.
         """
         mask = (msb << 7) + lsb
         try:
@@ -329,6 +355,67 @@ class Board(object):
         minor = data[1]
         self.firmware_version = (major, minor)
         self.firmware = two_byte_iter_to_str(data[2:])
+
+    def _handle_capability_response(self, *data):
+        self.capabilities = defaultdict(list)
+        i = 0
+        pin = 0
+        while i < len(data):
+            if data[i] != 127:
+                capability = data[i], data[i+1]
+                self.capabilities[pin].append(capability)
+                i += 2
+            else:
+                pin += 1  # When we hit 127, we move onto the next pin
+                i += 1
+
+        self.capabilities = dict(self.capabilities)  # Turn into a normal dictionary
+
+    def setup_layout_by_capabilities(self):
+        self.send_sysex(CAPABILITY_QUERY)
+        self.pass_time(1)
+        while self.bytes_available():
+            self.iterate()
+
+        number_pins = max(self.capabilities.keys())
+
+        layout = {
+            'digital': [],
+            'analog': [],
+            'pwm': [],
+            'input': [],
+            'servo': [],
+            'use_ports': True,
+            'disabled': []
+        }
+
+        for pin in range(number_pins):
+            data = self.capabilities.get(pin, [])
+            if len(data) > 0:
+                for modes in data:
+                    # Second byte is resolution, which isn't used current
+                    mode, _ = modes
+
+                    if mode == ANALOG:
+                        layout['analog'].append(pin)
+                    elif mode == DIGITAL:
+                        layout['digital'].append(pin)
+                    elif mode == PWM:
+                        layout['pwm'].append(pin)
+                    elif mode == INPUT:
+                        layout['input'].append(pin)
+                    elif mode == SERVO:
+                        layout['servo'].append(pin)
+                    else:
+                        logging.error("Pin {0} unknown mode {1}".format(
+                            pin, mode
+                    ))
+            else:
+                layout['digital'].append(pin)
+                layout['disabled'].append(pin)
+
+        self.setup_layout(layout)
+
 
 class Port(object):
     """ An 8-bit port on the board """

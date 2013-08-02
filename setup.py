@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 
-from distutils.core import setup
+from setuptools import setup
 
 with open('README.rst') as f:
     long_description = f.read()
 
 setup(
     name='pyFirmata',
-    version='0.9.5',  # Don't forget to change pyfirmata.__version__!
+    version='0.10.0',  # Don't forget to change pyfirmata.__version__!
     description="A Python interface for the Firmata procotol",
     long_description=long_description,
     author='Tino de Bruijn',
